@@ -1,0 +1,1574 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import json
+import requests 
+import time
+import datetime
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QMessageBox,
+    QTextEdit, QLineEdit, QPushButton, QComboBox, QTextBrowser,
+    QLabel, QSizePolicy, QMainWindow, QFrame, QStackedWidget, 
+    QStyle
+)
+from PyQt6.QtGui import QTextCursor, QFont, QPixmap, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSettings
+from PyQt6.QtWebEngineWidgets import QWebEngineView 
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage # QWebEngineProfile, QWebEnginePage 임포트
+
+# ====================================================================
+# 1. 경고 메시지 출력을 막기 위한 클래스 및 설정 (터미널 출력 억제)
+# ====================================================================
+class DevNull:
+    """표준 에러(stderr) 출력을 무시(Null)하기 위한 클래스"""
+    def write(self, msg):
+        pass
+    def flush(self, *args, **kwargs): # flush도 무시하도록 수정
+        pass
+
+# 웹엔진 관련 경고 메시지 억제 (주석 해제하면 메시지 표시)
+sys.stderr = DevNull()
+#sys.stdout = DevNull()  # stdout도 억제
+
+if sys.platform != "win32":
+    os.environ['QT_LOGGING_RULES'] = '*=false'
+    os.environ['QTWEBENGINE_DISABLE_SANDBOX'] = '1'
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3 --disable-extensions --disable-plugins --disable-dev-shm-usage'
+    os.environ['QT_ASSUME_STDERR_HAS_CONSOLE'] = '0'
+# ====================================================================
+
+
+# ====================================================================
+# Ollama API 통신을 위한 헬퍼 클래스 (모델 목록 가져오기)
+# ====================================================================
+class OllamaAPIHandler:
+    def __init__(self, api_url):
+        self.api_url = api_url
+
+    def get_models(self):
+        """Ollama API를 통해 사용 가능한 모델 목록을 가져옵니다."""
+        try:
+            url = f"{self.api_url}/api/tags"
+            response = requests.get(url, timeout=5)
+            
+            if response.status_code == 500:
+                # 500 에러: 서버 내부 오류 (모델 로딩 실패 등)
+                return []
+            
+            response.raise_for_status()
+            
+            data = response.json()
+            model_names = [m['name'] for m in data.get('models', [])]
+            return model_names
+        except requests.exceptions.RequestException as e:
+            # print(f"Ollama 모델 목록을 가져오는 데 실패했습니다: {e}")  # 출력 억제
+            return []
+
+# ====================================================================
+# Ollama API 통신을 위한 스레드 (비동기 처리)
+# ====================================================================
+class OllamaThread(QThread):
+    response_signal = pyqtSignal(str) 
+    error_signal = pyqtSignal(str)    
+    finished_with_time = pyqtSignal(float) 
+
+    def __init__(self, api_url, model, prompt):
+        super().__init__()
+        self.api_url = api_url
+        self.model = model
+        self.prompt = prompt
+
+    def run(self):
+        start_time = time.time()
+        max_retries = 2
+        
+        for attempt in range(max_retries + 1):
+            try:
+                url = f"{self.api_url}/api/generate"
+                headers = {"Content-Type": "application/json"}
+                data = {
+                    "model": self.model,
+                    "prompt": self.prompt,
+                    "stream": False 
+                }
+                
+                # ROCm 환경에서 모델 로딩 시간을 고려하여 타임아웃 연장
+                response = requests.post(url, headers=headers, json=data, timeout=900)
+                response.raise_for_status()
+                
+                result = response.json()
+                full_response = result.get('response', '응답 없음')
+                
+                end_time = time.time()
+                total_time = end_time - start_time
+                
+                self.response_signal.emit(full_response)
+                self.finished_with_time.emit(total_time)
+                return
+                
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                if "Connection aborted" in str(e) or "Remote end closed connection" in str(e):
+                    if attempt < max_retries:
+                        wait_time = 5 + (attempt * 3)  # 점진적 대기 시간 증가 (5, 8초)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        if "codellama" in self.model.lower():
+                            self.error_signal.emit(f"CodeLlama 모델 로딩 실패 (GPU 메모리 부족 또는 ROCm 호환성 문제)")
+                        else:
+                            self.error_signal.emit(f"Ollama 서버 연결 끊어짐 (모델 로딩 실패 가능성)")
+                        return
+                else:
+                    self.error_signal.emit(f"API 통신 오류: {e}")
+                    return
+            except requests.exceptions.RequestException as e:
+                self.error_signal.emit(f"API 통신 오류: {e}")
+                return
+            except Exception as e:
+                self.error_signal.emit(f"예상치 못한 오류: {e}")
+                return
+
+# ====================================================================
+# Ollama 모델 목록 로딩을 위한 스레드
+# ====================================================================
+class ModelLoaderThread(QThread):
+    models_loaded = pyqtSignal(list)
+
+    def __init__(self, api_url):
+        super().__init__()
+        self.api_url = api_url
+
+    def run(self):
+        """백그라운드에서 모델 목록을 가져옵니다."""
+        api_handler = OllamaAPIHandler(self.api_url)
+        models = api_handler.get_models()
+        self.models_loaded.emit(models)
+
+
+# ====================================================================
+# 웹뷰 권한 처리를 위한 커스텀 QWebEnginePage 클래스
+# ====================================================================
+class MyWebEnginePage(QWebEnginePage):
+    """
+    웹페이지의 권한 요청을 처리하기 위해 QWebEnginePage를 상속받는 커스텀 클래스.
+    """
+    def featurePermissionRequested(self, url, feature):
+        # 요청된 기능이 클립보드(Clipboard)와 관련된 것이라면,
+        # 사용자에게 묻지 않고 항상 허용(PermissionGrantedByUser)합니다.
+        if feature == QWebEnginePage.Feature.Clipboard:
+            self.setFeaturePermission(url, feature, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
+        else:
+            # 클립보드가 아닌 다른 모든 기능 요청은 기본 동작을 따르도록 부모 클래스의 함수를 호출합니다.
+            super().featurePermissionRequested(url, feature)
+
+    def createWindow(self, _type):
+        """
+        웹페이지가 새 창(window.open 등)을 요청할 때 호출됩니다.
+        Copilot의 PIN, 지문, 보안 키 등 다양한 인증 팝업을 처리하기 위해,
+        새로운 QWebEngineView를 독립된 창으로 생성하여 띄웁니다.
+        """
+        # 🌟 FIX: 새 창을 독립된 위젯으로 생성하여 팝업을 처리합니다.
+        # 1. 새로운 QWebEngineView 인스턴스를 생성합니다.
+        popup_view = QWebEngineView()
+        
+        # 2. 새 뷰의 페이지를 생성하고, 이 페이지가 닫힐 때 스스로 파괴되도록 설정합니다.
+        #    이렇게 하면 인증 창을 닫았을 때 메모리 누수를 방지할 수 있습니다.
+        # 🌟 FIX: 팝업창이 부모 창과 동일한 프로필(쿠키 저장소)을 사용하도록 명시적으로 설정합니다.
+        # 이렇게 해야 "다시 묻지 않음"과 같은 신뢰 정보가 영구적으로 저장됩니다.
+        parent_profile = self.profile()
+        popup_page = QWebEnginePage(parent_profile, popup_view)
+        popup_page.setAttribute(QWebEnginePage.WebAttribute.DeleteOnClose, True)
+        popup_view.setPage(popup_page)
+        
+        # 3. 새 뷰를 창으로 설정하고, 닫힐 때 위젯이 삭제되도록 합니다.
+        popup_view.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        popup_view.setWindowFlags(Qt.WindowType.Window) # 독립된 창으로 설정
+        popup_view.setWindowTitle("인증")
+        popup_view.resize(600, 700)
+        popup_view.show()
+        
+        # 4. 생성된 새 페이지 객체를 반환하여 QtWebEngine이 사용하도록 합니다.
+        return popup_page
+
+
+
+
+# ====================================================================
+# 메인 통합 채팅 GUI 클래스 (PyQt6)
+# ====================================================================
+class OllamaChatApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+                
+        # 🌟 FIX: OS 표준에 맞는 로그 경로 설정
+        if sys.platform == "win32":
+            # Windows: %LOCALAPPDATA%\mindDock\logs 경로 사용
+            local_appdata = os.getenv('LOCALAPPDATA')
+            if local_appdata:
+                self.log_path = os.path.join(local_appdata, "mindDock", "logs")
+            else: # Fallback
+                self.log_path = os.path.join(os.path.expanduser("~"), "mindDock", "logs")
+        else:
+            # Linux/macOS: ~/.cache/mindDock/logs 경로 사용
+            self.log_path = os.path.join(os.path.expanduser("~"), ".cache", "mindDock", "logs")
+
+        
+        # 5개 세션 관리
+        self.sessions = {
+            "Ollama": {"thread": None, "timer": None, "start_time": None},
+            "Gemini": {"thread": None, "timer": None, "start_time": None},
+            "Perplexity": {"thread": None, "timer": None, "start_time": None},
+            "Copilot": {"thread": None, "timer": None, "start_time": None},
+            "ChatGPT": {"thread": None, "timer": None, "start_time": None}
+        }
+        # 🌟 추가: 슬립 탭 기능 관련 변수
+        self.sleep_timers = {}
+        self.SLEEP_TIMEOUT = 900000 # 15분 (밀리초 단위)
+        self.sleep_state = {api: "awake" for api in ["Gemini", "Perplexity", "Copilot", "ChatGPT"]} # awake, shallow, deep
+        self.last_urls = {api: "" for api in ["Gemini", "Perplexity", "Copilot", "ChatGPT"]} # 딥슬립 복원용 URL 저장
+
+        self.last_response_text = None 
+        self.code_block_contents = {} # 🌟 FIX: 코드 복사 기능을 위해 코드 블록 원본 저장
+        
+        # ----------------------------------------------------
+        # 🌟 핵심 변경: 영구 프로파일 설정
+        # 🌟 핵심 변경: 웹뷰별 영구 프로파일 설정
+        # ----------------------------------------------------
+        if sys.platform == "win32":
+            # Windows: %APPDATA%\mindDock\profile 경로 사용
+            appdata = os.getenv('APPDATA')
+            base_path = appdata if appdata else os.path.expanduser("~")
+            self.base_profile_path = os.path.join(base_path, "mindDock", "profiles")
+        else:
+            # Linux/macOS: 기존 경로 유지
+            self.base_profile_path = os.path.join(
+                os.path.expanduser("~"), 
+                ".config", 
+                "mindDock_profiles"
+            )
+        os.makedirs(self.base_profile_path, exist_ok=True)
+
+        # 🌟 FIX: 설정 파일을 profiles 폴더 내의 mindDock.conf로 지정합니다.
+        settings_path = os.path.join(self.base_profile_path, "mindDock.conf")
+        self.settings = QSettings(settings_path, QSettings.Format.IniFormat)
+
+        self._create_readme_if_not_exists() # Readme 파일 생성은 유지
+
+        # 🌟 FIX: 설정 파일에서 Ollama API URL을 로드합니다. 이 코드가 누락되어 오류가 발생했습니다.
+        self.ollama_api = self.settings.value("ollama_api_url", "http://southstar.ddns.net:11434")
+        
+        # 🌟 FIX: 설정된 캐시 타입에 따라 QWebEngineProfile의 HttpCacheType 결정
+        cache_type_str = self.settings.value("webview_cache/type", "disk", type=str).lower()
+        if cache_type_str == "memory":
+            self.cache_type = QWebEngineProfile.HttpCacheType.MemoryHttpCache
+            print("INFO: 메모리 캐시 모드로 실행합니다.")
+        else:
+            self.cache_type = QWebEngineProfile.HttpCacheType.DiskHttpCache
+            print("INFO: 디스크 캐시 모드로 실행합니다.")
+
+        # 🌟 FIX: 각 웹뷰를 위한 개별 프로필 생성
+        self.profiles = {}
+        from PyQt6.QtWebEngineCore import QWebEngineSettings
+        for api_name in ["Gemini", "Copilot", "ChatGPT", "Perplexity"]:
+            profile_path = os.path.join(self.base_profile_path, api_name)
+            os.makedirs(profile_path, exist_ok=True)
+
+            profile = QWebEngineProfile(f"Profile_{api_name}", None)
+            profile.setPersistentStoragePath(profile_path)
+            profile.setCachePath(os.path.join(profile_path, "cache"))
+            profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+            profile.setHttpCacheType(self.cache_type)
+
+            # 🌟 FIX: 웹뷰별 캐시 크기 적용 (개별 설정 > 기본 설정 순)
+            default_cache_size = self.settings.value("webview_cache/default_size_mb", 30, type=int)
+            cache_size_mb = self.settings.value(f"webview_cache/{api_name}_size_mb", default_cache_size, type=int)
+            profile.setHttpCacheMaximumSize(cache_size_mb * 1024 * 1024)
+            profile.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
+            self.profiles[api_name] = profile
+        # ----------------------------------------------------
+        
+        # 로그 디렉토리가 없으면 생성 (안전 장치)
+        os.makedirs(self.log_path, exist_ok=True)
+
+        # 🌟 FIX: 로딩 속도 개선을 위해 API 순서 변경 및 기본값 수정
+        # 🌟 FIX: Ollama 메뉴를 항상 표시하도록 API 목록을 원래대로 복원합니다.
+        self.available_apis = ["Gemini", "Copilot", "ChatGPT", "Perplexity", "Ollama"]
+        self.current_api = "Gemini" # 기본 API를 Gemini로 변경
+        self.models = ["(모델 로딩 중...)"]
+        self.current_model = self.models[0]
+        self.is_models_loaded_ok = False
+        
+        self.is_first_show = True # 🌟 FIX: 창이 처음 표시되는지 확인하기 위한 플래그
+        self.update_title()
+        self._setup_status_indicator()
+        
+        self.init_ui()
+        self.load_initial_info()
+
+        # 🌟 FIX: 앱이 표시된 후 비동기적으로 Ollama 모델 목록 로딩 시작
+        if self.ollama_api: # Ollama API URL이 있을 때만 모델 로더를 실행합니다.
+            QTimer.singleShot(100, self.load_ollama_models_async)
+
+        # 🌟 FIX: 슬립 타이머를 __init__에서 한 번만 초기화
+        for api_name in self.web_views.keys():
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda name=api_name: self.put_tab_to_deep_sleep(name))
+            self.sleep_timers[api_name] = timer
+        self.set_window_icon()
+
+        # 🌟 FIX: 프로그램 시작 시 초기 API에 맞는 내비게이션 버튼 상태를 설정합니다.
+        self.api_changed(self.current_api)
+
+    def closeEvent(self, event):
+        """애플리케이션이 닫힐 때 호출되는 이벤트 핸들러입니다."""
+        # 🌟 FIX: QSettings를 사용하여 창 상태를 저장하고, 나머지 설정은 JSON에 저장합니다.
+        self._save_window_state()
+        super().closeEvent(event)
+    # ----------------------------------------------------
+
+    # 🌟 FIX: Readme.txt 파일 생성 함수
+    def _create_readme_if_not_exists(self):
+        """프로필 폴더에 Readme.txt 파일이 없으면 생성합니다."""
+        # 🌟 FIX: QSettings 파일 위치를 기준으로 Readme 생성
+        settings_path = self.settings.fileName()
+        readme_path = os.path.join(os.path.dirname(settings_path), "Readme.txt")
+
+        if not os.path.exists(readme_path):
+            readme_content = """==================================================
+mindDock - 통합 AI Chat Hub
+==================================================
+
+mindDock은 Ollama 로컬 모델과 주요 웹 AI 서비스를 하나의 인터페이스에서 사용할 수 있도록 만든 통합 AI 채팅 허브입니다.
+
+---
+### 주요 기능
+
+- **통합 인터페이스**: Ollama, Gemini, Copilot, ChatGPT, Perplexity를 탭으로 전환하며 사용 가능.
+- **세션 유지**: 각 웹 AI 서비스의 로그인 정보가 유지되어 앱을 재시작해도 다시 로그인할 필요가 없습니다.
+- **대화 내용 로깅**: 모든 대화 내용이 날짜 및 서비스별로 로그 파일에 자동으로 저장됩니다.
+- **상세한 환경설정**: `preferences.json` 파일을 통해 창 크기, 캐시 정책, 서버 주소 등을 직접 설정할 수 있습니다.
+- **독립된 인증 창**: PIN, Passkey 등 복잡한 인증 방식도 별도의 창을 통해 안전하게 처리합니다.
+
+---
+### 환경설정 (mindDock.conf 파일)
+
+앱을 한 번 실행하면 아래 위치에 설정 파일이 생성됩니다. 이 파일을 직접 수정하여 앱의 동작을 변경할 수 있습니다.
+
+- **파일 위치**:
+  - Linux/macOS: `~/.config/mindDock_profiles/mindDock.conf`
+  - Windows: `%APPDATA%\\mindDock\\profiles\\mindDock.conf`
+
+- **주요 설정 항목**:
+  - `save_window_state` (true/false): `true`로 설정하면 앱 종료 시 창의 크기, 위치, 상태(최대화 등)를 저장합니다.
+  - `ollama_api_url`: 사용할 Ollama 서버의 주소를 입력합니다.
+  - `webview_cache/type`: 웹뷰 캐시 유형 ("disk" 또는 "memory")
+  - `webview_cache/default_size_mb`: 기본 캐시 크기 (MB)
+  - `webview_cache/Gemini_size_mb`: Gemini 웹뷰의 캐시 크기 (MB) (다른 웹뷰도 동일한 형식)
+
+---
+### 데이터 및 로그 파일
+
+- **프로필 데이터 (로그인 정보, 쿠키 등)**:
+  - Linux/macOS: `~/.config/mindDock_profiles/`
+  - Windows: `%APPDATA%\\mindDock\\profiles\\`
+  - 각 웹뷰의 데이터는 이 폴더 아래에 서비스 이름(Gemini, Copilot 등)으로 된 하위 폴더에 개별적으로 저장됩니다.
+
+- **대화 로그**:
+  - Linux/macOS: `~/.cache/mindDock/logs/`
+  - Windows: `%LOCALAPPDATA%\\mindDock\\logs\\`
+  - 대화 내용은 날짜와 서비스 이름으로 구분된 `.log` 파일로 저장됩니다.
+"""
+            try:
+                with open(readme_path, 'w', encoding='utf-8') as f:
+                    f.write(readme_content)
+            except Exception as e:
+                print(f"경고: Readme.txt 파일 생성 중 오류 발생: {e}")
+
+    # 🌟 FIX: QSettings를 사용한 창 상태 저장 및 로드 함수
+    def _save_window_state(self):
+        """QSettings를 사용하여 현재 화면 기준 창의 상대 위치/크기 및 상태를 저장합니다."""
+        if not self.settings.value("save_window_state", True, type=bool):
+            return
+
+        # 🌟 FIX: 현재 창이 속한 스크린 정보를 가져옵니다.
+        scr = self.screen() or QApplication.primaryScreen()
+        screen_geom = scr.availableGeometry()
+        win_geom = self.geometry()
+
+        # 🌟 FIX: 화면 대비 상대 비율을 계산하여 저장합니다.
+        if screen_geom.width() > 0 and screen_geom.height() > 0:
+            x_ratio = (win_geom.x() - screen_geom.x()) / screen_geom.width()
+            y_ratio = (win_geom.y() - screen_geom.y()) / screen_geom.height()
+            w_ratio = win_geom.width() / screen_geom.width()
+            h_ratio = win_geom.height() / screen_geom.height()
+
+            self.settings.setValue("screenName", scr.name()) # 🌟 FIX: 스크린 이름 저장
+            self.settings.setValue("geometry/xRatio", x_ratio)
+            self.settings.setValue("geometry/yRatio", y_ratio)
+            self.settings.setValue("geometry/wRatio", w_ratio)
+            self.settings.setValue("geometry/hRatio", h_ratio)
+
+        self.settings.setValue("windowState", self.saveState())
+
+        # 나머지 설정 저장 (기본값이면 저장하지 않음)
+        self.settings.setValue("ollama_api_url", self.ollama_api)
+        self.settings.setValue("webview_cache/type", "disk" if self.cache_type == QWebEngineProfile.HttpCacheType.DiskHttpCache else "memory")
+        
+        self.settings.setValue("webview_cache/default_size_mb", self.settings.value("webview_cache/default_size_mb", 30, type=int))
+        for api_name in ["Gemini", "Copilot", "ChatGPT", "Perplexity"]:
+            default_size = self.settings.value("webview_cache/default_size_mb", 30, type=int)
+            current_size = self.settings.value(f"webview_cache/{api_name}_size_mb", default_size, type=int)
+            self.settings.setValue(f"webview_cache/{api_name}_size_mb", current_size)
+
+    def _load_window_state(self):
+        """QSettings에서 저장된 화면을 찾아 상대 위치/크기를 복원합니다."""
+        screen_name = self.settings.value("screenName", type=str)
+        target_screen = None
+
+        # 1. 저장된 이름으로 스크린 찾기
+        if screen_name:
+            for scr in QApplication.screens():
+                if scr.name() == screen_name:
+                    target_screen = scr
+                    break
+        
+        # 2. 못 찾으면 현재 마우스 커서가 있는 스크린 또는 기본 스크린 사용
+        if not target_screen:
+            target_screen = QApplication.screenAt(self.cursor().pos()) or QApplication.primaryScreen()
+
+        screen_rect = target_screen.availableGeometry()
+
+        # 3. 저장된 비율을 읽어와 절대 좌표로 변환 (기본값: 중앙 60%)
+        x_ratio = self.settings.value("geometry/xRatio", 0.2, type=float)
+        y_ratio = self.settings.value("geometry/yRatio", 0.2, type=float)
+        w_ratio = self.settings.value("geometry/wRatio", 0.6, type=float)
+        h_ratio = self.settings.value("geometry/hRatio", 0.6, type=float)
+
+        x = screen_rect.x() + int(screen_rect.width() * x_ratio)
+        y = screen_rect.y() + int(screen_rect.height() * y_ratio)
+        w = int(screen_rect.width() * w_ratio)
+        h = int(screen_rect.height() * h_ratio)
+
+        self.setGeometry(x, y, w, h)
+
+        # 4. 창 상태(최대화 등) 복원
+        state = self.settings.value("windowState")
+        if state:
+            self.restoreState(state)
+
+    def set_window_icon(self):
+        """OS에 맞는 경로에서 아이콘을 찾아 창 아이콘으로 설정합니다."""
+        icon_path = ""
+        if sys.platform == "win32":
+            if getattr(sys, 'frozen', False):
+                base_path = sys._MEIPASS
+            else:
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(base_path, "mindDock.png")
+        else:
+            # Linux: 표준 아이콘 경로 사용
+            icon_path = os.path.expanduser("~/.local/share/icons/mindDock.png")
+
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+    def showEvent(self, event):
+        """창이 처음 화면에 표시될 때 한 번만 호출됩니다."""
+        super().showEvent(event)
+        if self.is_first_show:
+            self.is_first_show = False
+            # 🌟 FIX: 윈도우 매니저가 창을 그린 후, QSettings에서 위치를 복원합니다.
+            # QTimer.singleShot을 사용하여 이벤트 루프가 안정된 후 실행되도록 합니다.
+            QTimer.singleShot(50, self._load_window_state)
+
+
+    # 🌟 FIX: Ollama 모델을 비동기적으로 로드하는 함수
+    def load_ollama_models_async(self):
+        """백그라운드 스레드를 사용하여 Ollama 모델 목록을 가져옵니다."""
+        self._update_status_indicator("waiting", "Ollama 모델 목록 로딩 중...")
+        self.model_loader_thread = ModelLoaderThread(self.ollama_api)
+        self.model_loader_thread.models_loaded.connect(self.on_models_loaded)
+        self.model_loader_thread.start()
+
+    def on_models_loaded(self, models):
+        """모델 로딩 완료 시 호출되는 슬롯."""
+        if models:
+            self.models = models
+            self.is_models_loaded_ok = True
+            self.model_combo.clear()
+            self.model_combo.addItems(self.models)
+            self.current_model = self.models[0]
+            self._update_status_indicator("ready", f"Ollama 모델 로드 완료 ({len(self.models)}개)")
+        else:
+            self.models = ["(서버 연결 실패)"]
+            self.is_models_loaded_ok = False
+            self._update_status_indicator("error", "Ollama 서버 연결 실패. 웹뷰 모드만 사용 가능.")
+
+    # ================================================================
+    # 로그 관리 함수
+    # ================================================================
+    def get_log_filename(self):
+        """현재 날짜, API, 모델을 포함한 로그 파일 이름을 생성합니다."""
+        date_str = datetime.datetime.now().strftime("%Y%m%d")
+        model_name_safe = self.current_model.replace(":", "-")
+        
+        # 로그 파일명 생성 로직은 유지: Ollama일 때만 모델명 포함
+        if self.current_api == "Ollama":
+            filename = f"chatbot_{date_str}_{self.current_api}_{model_name_safe}.log"
+        else:
+            filename = f"chatbot_{date_str}_{self.current_api}.log"
+            
+        return os.path.join(self.log_path, filename)
+
+    def write_log(self, sender, message):
+        """메시지를 로그 파일에 기록합니다."""
+        timestamp = datetime.datetime.now().strftime("[%H:%M:%S]")
+        
+        if self.current_api == "Ollama":
+            sender_info = f"[{sender}/{self.current_model}]"
+        else:
+            sender_info = f"[{sender}/{self.current_api}]"
+            
+        log_entry = f"{timestamp} {sender_info} {message}\n"
+        
+        try:
+            filename = self.get_log_filename()
+            # 파일 쓰기 모드는 'a'(append)로 유지하여 실시간 기록
+            with open(filename, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+        except Exception as e:
+            # 로그 파일 쓰기 실패 시 GUI에 오류 메시지 출력 (디버깅 용)
+            self.chat_log.append(f"<span style='color: red;'>[로그 오류] 파일 생성/쓰기 실패: {e}</span>")
+            # print(f"로그 파일 쓰기 오류: {e}")  # 출력 억제
+    # ================================================================
+    
+    # ================================================================
+    # 웹뷰 내용 추출 및 로그 기록 함수 (안정성 강화)
+    # ================================================================
+    def handle_webview_log(self, api_name, retry_count=0):
+        """웹뷰에서 AI의 최종 응답 텍스트를 추출하고 로그에 기록합니다."""
+        current_web_view = self.web_views.get(api_name)
+        if not current_web_view:
+            return
+
+        js_code = """
+            (function() {
+                var allMessages = [];
+                var selectors = [
+                    '[data-message-author-role="model"]',
+                    '.model-response', 
+                    '.answer-content',
+                    '[data-testid="answer"]',
+                    '.prose',
+                    '.cib-message-response',
+                    '[data-content]',
+                    '.response-message',
+                    '.markdown',
+                    'div[data-message-id]',
+                    '.message',
+                    'p, div'
+                ];
+                
+                for (var i = 0; i < selectors.length; i++) {
+                    try {
+                        var elements = document.querySelectorAll(selectors[i]);
+                        for (var j = 0; j < elements.length; j++) {
+                            var text = elements[j].textContent || elements[j].innerText || '';
+                            text = text.trim();
+                            if (text.length > 20 && !text.includes('메시지를 입력') && !text.includes('Send message')) {
+                                allMessages.push({
+                                    text: text,
+                                    selector: selectors[i],
+                                    count: allMessages.length + 1
+                                });
+                            }
+                        }
+                    } catch(e) {}
+                }
+                
+                return allMessages.length > 0 ? allMessages[allMessages.length - 1] : null;
+            })();
+        """
+        
+        current_web_view.page().runJavaScript(js_code, lambda result: self._process_webview_response(result, api_name, retry_count))
+
+    def _process_webview_response(self, result, api_name, retry_count):
+        """JavaScript 실행 결과를 받아 로그를 기록하는 콜백 함수."""
+        
+        # 🌟 디버깅: 결과 상세 정보 표시
+        self.chat_log.append(f"<span style='color: gray;'>[디버그] 시도 {retry_count + 1}: result={type(result)}, 내용={str(result)[:100] if result else 'None'}</span>")
+        
+        if result and isinstance(result, dict) and result.get('text'):
+            result_text = result['text']
+            
+            if result_text != self.last_response_text:
+                self.write_log("AI", f"\n{result_text}")
+                self.last_response_text = result_text
+
+                self.chat_log.append(f"<strong>[✓ AI 응답 저장 성공]</strong> {api_name} - 길이: {len(result_text)}자")
+                self.set_cursor_to_end(self.chat_log)
+                return
+            else:
+                self.chat_log.append(f"<span style='color: orange;'>[중복] 이전과 동일한 응답 감지, 재시도...</span>")
+        
+        if retry_count < 3:
+            retry_delay = 5000 + (retry_count * 3000)
+            QTimer.singleShot(retry_delay, lambda: self.handle_webview_log(api_name, retry_count + 1))
+            self.chat_log.append(f"<span style='color: orange;'>[대기 {retry_count + 1}/3] {api_name} 응답 찾는 중... ({retry_delay//1000}초 후)</span>")
+        else:
+            self.write_log("AI", f"[{api_name}] 응답 추출 실패 (3번 시도 후 포기)")
+            self.chat_log.append(f"<span style='color: red;'>[✗ 최종 실패] {api_name} AI 응답을 찾을 수 없습니다. 수동 확인 필요.</span>")
+        
+        self.set_cursor_to_end(self.chat_log)
+    # ================================================================
+
+    def _setup_status_indicator(self):
+        """상태바에 색상 표시등 설정"""
+        self.status_indicator = QLabel()
+        self.status_indicator.setFixedSize(12, 12)
+        self.statusBar().addWidget(self.status_indicator)
+        # 메시지를 별도 QLabel로 생성
+        self.status_message = QLabel("준비 중...")
+        self.status_message.setContentsMargins(2, 0, 0, 0)
+        self.statusBar().addWidget(self.status_message)
+    
+    def _update_status_indicator(self, status, message):
+        """상태 표시등 업데이트"""
+        colors = {
+            "ready": "#28a745",    # 초록색 (준비 완료)
+            "waiting": "#ff8c00",  # 주황색 (대기 중)
+            "complete": "#28a745", # 초록색 (완룼)
+            "error": "#dc3545"     # 빨간색 (오류)
+        }
+        color = colors.get(status, "#6c757d")
+        self.status_indicator.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color};
+                border-radius: 6px;
+                border: 1px solid #333;
+            }}
+        """)
+        self.status_message.setText(message)
+
+    def update_title(self):
+        """현재 API와 모델에 따라 창 타이틀을 업데이트합니다."""
+        if self.current_api == "Ollama":
+            title = f'mindDock - 통합 AI Chat Hub [Ollama(Local) - {self.current_model}]'
+        else:
+            title = f'mindDock - 통합 AI Chat Hub [{self.current_api}]'
+            
+        self.setWindowTitle(title)
+
+
+    def init_ui(self):
+        self.resize(900, 800) 
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # 1. 채팅/웹뷰 영역 (QStackedWidget)
+        self.stacked_widget = QStackedWidget()
+        
+        # 1-1. Ollama 전용 텍스트 로그 (Index 0)
+        self.chat_log = QTextBrowser()
+        self.chat_log.setReadOnly(True)
+        # HTML 렌더링을 허용하여 블록 배경색 처리 가능
+        self.chat_log.setAcceptRichText(True)
+        # 고정폭 폰트로 HTML 엔티티 표시 일관성 개선
+        # 🌟 FIX: Copy Code 링크 클릭을 처리하기 위해 anchorClicked 시그널 연결
+        self.chat_log.anchorClicked.connect(self.handle_anchor_click)
+        font = QFont("Consolas, Monaco, 'Courier New', monospace", 10)
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        self.chat_log.setFont(font)
+        self.chat_log.setStyleSheet("border: 1px solid #ccc; padding: 10px; background-color: #f7f7f7;")
+        self.stacked_widget.addWidget(self.chat_log) 
+        
+        # 1-2. 웹뷰 (각 서비스별 인스턴스 유지)
+        
+        # 🌟 영구 프로파일을 사용하는 웹뷰 생성
+        # 🌟 FIX: API 순서에 맞게 생성 및 추가 순서 변경
+        self.web_views = {}
+        for api_name in ["Gemini", "Copilot", "ChatGPT", "Perplexity"]:
+            view = QWebEngineView()
+            # 🌟 FIX: 각 웹뷰에 맞는 개별 프로필을 사용하여 페이지를 설정합니다.
+            view.setPage(MyWebEnginePage(self.profiles[api_name], view))
+            self.web_views[api_name] = view
+
+        self.stacked_widget.addWidget(self.web_views["Gemini"])     # Index 1
+        self.stacked_widget.addWidget(self.web_views["Copilot"])    # Index 2
+        self.stacked_widget.addWidget(self.web_views["ChatGPT"])    # Index 3
+        self.stacked_widget.addWidget(self.web_views["Perplexity"]) # Index 4
+        
+        main_layout.addWidget(self.stacked_widget)
+
+        # 🌟 FIX: 초기 API가 Gemini이므로, Gemini 웹뷰(Index 1)를 먼저 표시합니다.
+        if self.current_api == "Gemini":
+            self.stacked_widget.setCurrentIndex(1)
+
+
+        # 2. 채팅 입력 창 및 전송 버튼 
+        self.input_widget = QWidget() 
+        input_layout = QHBoxLayout(self.input_widget)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.input_line = QLineEdit()
+        self.input_line.setPlaceholderText("메시지를 입력하세요...")
+        self.input_line.setObjectName("input_line") # ID 부여
+        self.input_line.returnPressed.connect(self.send_message)
+        
+        self.send_button = QPushButton("전송")
+        self.send_button.setObjectName("send_button") # ID 부여
+        # 🌟 FIX: 전송 버튼에 아이콘 추가
+        self.send_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight))
+        self.send_button.clicked.connect(self.send_message)
+
+        input_layout.addWidget(self.input_line)
+        input_layout.addWidget(self.send_button)
+        main_layout.addWidget(self.input_widget) 
+        
+        # 🌟 FIX: 초기 API가 Ollama가 아니므로, 채팅 입력창을 기본적으로 숨깁니다.
+        self.input_widget.setVisible(self.current_api == "Ollama")
+
+        # 3. API/모델 리스트박스 및 종료 버튼 
+        control_frame = QFrame()
+        control_frame.setObjectName("control_frame") # ID 부여
+        control_layout = QHBoxLayout(control_frame)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+
+        # API 리스트박스
+        self.api_combo = QComboBox()
+        # 🌟 FIX: Ollama를 Ollama(Local)로 표시하도록 수정
+        display_apis = [api if api != "Ollama" else "Ollama(Local)" for api in self.available_apis]
+        self.api_combo.addItems(display_apis)
+        # 🌟 FIX: 기본 선택 항목을 UI 표시 이름에 맞게 수정
+        self.api_combo.setCurrentText(self.current_api if self.current_api != "Ollama" else "Ollama(Local)")
+        self.api_combo.currentTextChanged.connect(self.api_changed)
+        control_layout.addWidget(self.api_combo)
+        
+        # 웹뷰 내비게이션 버튼 (웹뷰 모드용) - API 콤보박스 바로 옆에 배치
+        self.back_button = QPushButton("") # 🌟 FIX: 텍스트 제거
+        self.back_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack))
+        self.back_button.setToolTip("뒤로가기 (Alt+Left)")
+        self.back_button.clicked.connect(self.go_back)
+        self.back_button.setVisible(False)
+        self.back_button.setEnabled(False)
+        self.back_button.setFixedSize(30, 30)
+        control_layout.addWidget(self.back_button)
+        
+        self.forward_button = QPushButton("") # 🌟 FIX: 텍스트 제거
+        self.forward_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward))
+        self.forward_button.setToolTip("앞으로가기 (Alt+Right)")
+        self.forward_button.clicked.connect(self.go_forward)
+        self.forward_button.setVisible(False)
+        self.forward_button.setEnabled(False)
+        self.forward_button.setFixedSize(30, 30)
+        control_layout.addWidget(self.forward_button)
+
+        # 🌟 FIX: 웹뷰 성능 저하 시 수동으로 새로고침할 수 있는 버튼 추가
+        self.refresh_button = QPushButton("") # 🌟 FIX: 텍스트 제거
+        self.refresh_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.refresh_button.setToolTip("현재 웹뷰 페이지 새로고침 (느려질 때 사용, F5 또는 Ctrl+R)")
+        self.refresh_button.clicked.connect(self.refresh_current_view)
+        self.refresh_button.setVisible(False)
+        self.refresh_button.setFixedSize(30, 30)
+        control_layout.addWidget(self.refresh_button)
+        
+        # Model 리스트박스
+        self.model_combo = QComboBox()
+        self.model_combo.addItems(self.models)
+        self.model_combo.setCurrentText(self.current_model)
+        self.model_combo.currentTextChanged.connect(self.model_changed)
+        # 🌟 FIX: 초기 API가 Ollama가 아니므로, 모델 콤보박스를 기본적으로 숨깁니다.
+        self.model_combo.setVisible(False)
+        control_layout.addWidget(self.model_combo)
+        
+        # 취소 버튼 (초기에는 숨김)
+        self.cancel_button = QPushButton("취소")
+        # 🌟 FIX: 취소 버튼에 아이콘 추가
+        self.cancel_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCancelButton))
+        self.cancel_button.setObjectName("cancel_button") # ID 부여
+        self.cancel_button.clicked.connect(self.cancel_request)
+        self.cancel_button.setVisible(False)
+        self.cancel_button.setFixedSize(50, 30)
+        control_layout.addWidget(self.cancel_button)
+        
+        control_layout.addStretch(1) 
+        
+        # 🌟 FIX: About 버튼 추가
+        self.about_button = QPushButton("About")
+        # 🌟 FIX: About 버튼에 아이콘 추가
+        self.about_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
+        self.about_button.setObjectName("about_button") # ID 부여
+        self.about_button.clicked.connect(self.show_about_dialog)
+        self.about_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        control_layout.addWidget(self.about_button)
+
+        # 🌟 FIX: 캐시 삭제 버튼 추가 (웹뷰 오류 해결용)
+        self.clear_cache_button = QPushButton("캐시 삭제")
+        self.clear_cache_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogResetButton))
+        self.clear_cache_button.setToolTip("현재 활성화된 웹뷰의 캐시, 쿠키, 로그인 정보를 삭제하고 새로고침합니다.")
+        self.clear_cache_button.setObjectName("clear_cache_button") # 스타일 적용을 위한 ID
+        self.clear_cache_button.clicked.connect(self.clear_current_webview_cache)
+        self.clear_cache_button.setVisible(False) # 웹뷰 모드에서만 보이도록 초기에는 숨김
+        control_layout.addWidget(self.clear_cache_button)
+
+
+        # 종료 버튼
+        self.exit_button = QPushButton("종료")
+        # 🌟 FIX: 종료 버튼에 아이콘 추가
+        self.exit_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton))
+        self.exit_button.setObjectName("exit_button") # ID 부여
+        self.exit_button.clicked.connect(QApplication.instance().quit)
+        self.exit_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed) 
+        control_layout.addWidget(self.exit_button)
+
+        main_layout.addWidget(control_frame)
+        
+        # 웹뷰가 로드될 때마다 CSS를 주입하고 내비게이션 버튼 업데이트
+        # 🌟 DEBUG: CSS/JS 주입 로직을 임시로 비활성화하여 문제 원인 파악
+        for api_name, view in self.web_views.items():
+            # view.loadFinished.connect(self._inject_css_on_load)
+            # view.urlChanged.connect(self._inject_css_on_load)
+            view.loadFinished.connect(self.update_navigation_buttons) # 내비게이션 버튼 업데이트는 유지
+            view.urlChanged.connect(self.update_navigation_buttons)   # 내비게이션 버튼 업데이트는 유지
+    def load_initial_info(self):
+        """초기 정보를 로드하고 각 웹뷰에 URL을 미리 설정. Ollama 정보는 제외."""
+        # 🌟 FIX: 초기 시스템 정보 메시지를 숨겨 화면을 깔끔하게 유지합니다.
+        self.set_cursor_to_end(self.chat_log)
+
+        url_map = {
+            "Gemini": "https://gemini.google.com/app",
+            "Copilot": "https://copilot.microsoft.com/",
+            "ChatGPT": "https://chat.openai.com/",
+            "Perplexity": "https://www.perplexity.ai/",
+        }
+        for api_name, url in url_map.items():
+            if api_name in self.web_views:
+                self.web_views[api_name].setUrl(QUrl(url))
+
+
+    # 🌟 FIX: About 다이얼로그 표시 함수
+    def show_about_dialog(self):
+        """About 정보를 보여주는 다이얼로그를 생성하고 표시합니다."""
+        about_dialog = QMessageBox(self)
+        about_dialog.setWindowTitle("About mindDock")
+
+        # 로고 이미지 설정
+        icon_path = ""
+        if sys.platform == "win32":
+            # Windows: 패키징된 경우와 스크립트 실행 경우를 모두 처리
+            if getattr(sys, 'frozen', False):
+                # PyInstaller로 패키징된 경우, 실행 파일과 함께 있는 경로
+                base_path = sys._MEIPASS
+            else:
+                # 일반 스크립트로 실행된 경우
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(base_path, "mindDock.png")
+        else:
+            # Linux/macOS: 지정된 표준 경로 사용
+            icon_path = os.path.expanduser("~/.local/share/icons/mindDock.png")
+
+        if os.path.exists(icon_path):
+            pixmap = QPixmap(icon_path).scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            about_dialog.setIconPixmap(pixmap)
+
+        
+        title = "<h3>mindDock</h3>"
+        description = "<p>Ollama 및 주요 웹 AI 서비스를 통합하여<br>하나의 인터페이스에서 사용할 수 있는 AI Chat Hub입니다.</p>"
+        contact = "<p><b>Contact:</b> byeongtaek.lee@gmail.com</p>"
+        copyright_info = "<p>Copyright © 2025 BTLee. All rights reserved.</p>"
+
+        about_dialog.setText(title)
+        about_dialog.setInformativeText(f"{description}{contact}{copyright_info}")
+        
+        about_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        about_dialog.exec()
+
+    # 🌟 FIX: 누락된 'clear_current_webview_cache' 함수를 추가합니다.
+    def clear_current_webview_cache(self):
+        """
+        현재 활성화된 웹뷰의 프로필 디렉토리 내용을 삭제하고 새로고침합니다.
+        """
+        if self.current_api == "Ollama":
+            return
+
+        reply = QMessageBox.question(self, f"'{self.current_api}' 캐시 삭제",
+                                     f"'{self.current_api}' 웹뷰의 로그인 정보, 쿠키, 캐시가 모두 삭제됩니다.\n"
+                                     "삭제 후 페이지가 새로고침되며, 다시 로그인해야 할 수 있습니다.\n\n"
+                                     "계속하시겠습니까?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+
+        if reply == QMessageBox.StandardButton.Yes:
+            import shutil
+            profile_path = os.path.join(self.base_profile_path, self.current_api)
+            try:
+                # 프로필 디렉토리 내의 모든 파일과 하위 디렉토리 삭제
+                for filename in os.listdir(profile_path):
+                    file_path = os.path.join(profile_path, filename)
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                self._update_status_indicator("complete", f"{self.current_api} 캐시 삭제 완료. 새로고침합니다.")
+                self.refresh_current_view() # 캐시 삭제 후 웹뷰 새로고침
+            except Exception as e:
+                QMessageBox.critical(self, "오류", f"캐시 삭제 중 오류가 발생했습니다:\n{e}")
+
+    def _inject_css_on_load(self):
+        """웹페이지 로드 완료 시 웹뷰 내부의 CSS 스타일을 주입"""
+        # 🌟 DEBUG: CSS/JS 주입 로직을 임시로 비활성화합니다.
+        # 이 함수는 이제 아무 작업도 수행하지 않습니다.
+        return
+
+
+    def _restore_current_status(self):
+        """현재 모드에 맞는 상태 메시지로 복귀"""
+        if self.current_api == "Ollama":
+            if not self.is_models_loaded_ok:
+                self._update_status_indicator("error", "Ollama 서버 오류 (500 에러/모델 로딩 실패) - 웹뷰 모드만 사용 가능")
+            else:
+                self._update_status_indicator("ready", f"Ollama 모드: 모델 '{self.current_model}' 사용 중")
+        else:
+            self._update_status_indicator("ready", f"웹뷰 모드: {self.current_api}에서 직접 대화하세요.")
+    
+    def api_changed(self, api_name):
+        # 🌟 FIX: UI에 표시된 'Ollama(Local)'을 내부 키 'Ollama'로 변환
+        if api_name == "Ollama(Local)":
+            api_name = "Ollama"
+            
+        self.current_api = api_name
+        self.last_response_text = None
+        
+        # 알림 타이머 취소 (새로운 API로 전환 시)
+        if hasattr(self, 'notification_timer') and self.notification_timer.isActive():
+            self.notification_timer.stop() 
+        
+        is_ollama = (api_name == "Ollama")
+        
+        self.model_combo.setVisible(is_ollama) 
+        self.input_widget.setVisible(is_ollama)
+        
+        # 웹뷰 내비게이션 버튼 표시/숨김 및 상태 업데이트
+        if hasattr(self, 'back_button'):
+            self.back_button.setVisible(not is_ollama)
+        if hasattr(self, 'forward_button'):
+            self.forward_button.setVisible(not is_ollama)
+        if hasattr(self, 'refresh_button'):
+            self.refresh_button.setVisible(not is_ollama)
+        if hasattr(self, 'clear_cache_button'):
+            self.clear_cache_button.setVisible(not is_ollama)
+        
+        # 웹뷰 모드로 전환시 버튼 상태 업데이트
+        if not is_ollama:
+            self.update_navigation_buttons()
+        
+        self.update_title()
+        
+        # 🌟 FIX: 타이머 초기화 로직을 __init__으로 이동했으므로 여기서는 제거
+        self.write_log("시스템", f"API 전환: {api_name} 모드로 변경")
+
+        if is_ollama:
+            self.stacked_widget.setCurrentIndex(0)
+            # 🌟 FIX: Ollama URL 설정 여부에 따라 다른 상태 메시지를 표시합니다.
+            if not self.ollama_api:
+                self._update_status_indicator("error", "Ollama 서버 URL이 설정되지 않았습니다. (preferences.json)")
+                # URL이 없으면 입력창과 모델 콤보박스를 비활성화합니다.
+                self.input_line.setEnabled(False)
+                self.send_button.setEnabled(False)
+                self.model_combo.setEnabled(False)
+            else:
+                self.input_line.setEnabled(True)
+                self.send_button.setEnabled(True)
+                self.model_combo.setEnabled(True)
+                self._restore_current_status() # 정상적인 상태 메시지 복원
+        else:
+            index_map = {"Gemini": 1, "Copilot": 2, "ChatGPT": 3, "Perplexity": 4}
+            target_index = index_map.get(api_name, 0)
+            self.stacked_widget.setCurrentIndex(target_index)
+            self._update_status_indicator("ready", f"{api_name} 웹뷰 모드")
+            # self._inject_css_on_load() # 🌟 DEBUG: 비활성화
+        
+        # 🌟 추가: 슬립 탭 타이머 관리
+        self.manage_sleep_timers()
+
+    # 🌟 추가: 슬립 탭 관련 함수들
+    def manage_sleep_timers(self):
+        """현재 API 탭을 제외한 모든 웹뷰 탭의 슬립 타이머를 시작/중지합니다."""
+        for api_name, timer in self.sleep_timers.items():
+            view = self.web_views.get(api_name)
+            if not view: continue
+
+            if api_name == self.current_api:
+                # 1. 활성 탭: 타이머 중지 및 깨우기
+                if timer.isActive():
+                    timer.stop()
+                
+                if self.sleep_state[api_name] != "awake":
+                    self.wake_up_tab(api_name)
+            else:
+                # 2. 비활성 탭: 얕은 절전으로 전환하고 깊은 절전 타이머 시작
+                if self.sleep_state[api_name] == "awake":
+                    self.put_tab_to_shallow_sleep(api_name)
+                    timer.start(self.SLEEP_TIMEOUT)
+
+    def put_tab_to_shallow_sleep(self, api_name):
+        """탭을 얕은 절전 모드로 전환 (렌더링 중지)."""
+        # 🌟 FIX: setPage(None) 대신 setVisible(False)를 사용하여 뷰를 숨깁니다.
+        view = self.web_views.get(api_name)
+        if view and self.sleep_state[api_name] == "awake":
+            self.sleep_state[api_name] = "shallow"
+            print(f"[{api_name}] 탭이 얕은 절전(Shallow Sleep) 모드로 전환되었습니다.")
+
+    def put_tab_to_deep_sleep(self, api_name):
+        """지정된 API 이름의 탭을 깊은 절전 모드로 전환합니다 (메모리 해제)."""
+        if api_name == self.current_api: return # 현재 탭은 재우지 않음
+
+        view = self.web_views.get(api_name)
+        if view and self.sleep_state[api_name] == "shallow":
+            self.sleep_state[api_name] = "deep"
+            # 🌟 페이지를 파괴하기 직전의 URL을 저장
+            self.last_urls[api_name] = view.page().url().toString()
+            view.setUrl(QUrl("about:blank")) # 페이지를 비워 리소스 해제
+            print(f"[{api_name}] 탭이 깊은 절전(Deep Sleep) 모드로 전환되었습니다.")
+
+    def wake_up_tab(self, api_name):
+        """절전 모드의 탭을 다시 활성화(URL 로드)합니다."""
+        view = self.web_views.get(api_name)
+        if not view: return
+        
+        # 🌟 FIX: setPage를 다시 연결하는 대신 setVisible(True)로 뷰를 다시 표시합니다.
+        if self.sleep_state[api_name] == "shallow":
+            # 얕은 절전 복원: 뷰를 다시 보이게 합니다.
+            print(f"[{api_name}] 탭이 얕은 절전에서 복원되었습니다. (즉시)")
+        elif self.sleep_state[api_name] == "deep":
+            # 🌟 FIX: 깊은 절전 복원 시, 항상 기본 URL로 접속하도록 수정 (로그인 문제 해결)
+            url_map = { "Gemini": "https://gemini.google.com/app", "Perplexity": "https://www.perplexity.ai/", "Copilot": "https://copilot.microsoft.com/", "ChatGPT": "https://chat.openai.com/" }
+            restore_url = url_map.get(api_name)
+            view.setUrl(QUrl(restore_url))
+            print(f"[{api_name}] 탭이 깊은 절전에서 복원되었습니다. (기본 URL로 접속)")
+        
+        self.sleep_state[api_name] = "awake"
+
+
+    def model_changed(self, model_name):
+        self.current_model = model_name
+        # 🌟 FIX: 모델 변경 시 화면에 표시되던 메시지를 숨깁니다.
+        self._update_status_indicator("ready", f"Ollama 모드: 모델이 '{self.current_model}'로 변경되었습니다.")
+        
+        self.update_title() 
+        self.set_cursor_to_end(self.chat_log)
+
+        
+    def send_message(self):
+        prompt = self.input_line.text().strip()
+        if not prompt:
+            return
+
+        QApplication.clipboard().setText(prompt)
+        self.input_line.clear()
+            
+        if self.current_api == "Ollama":
+            # Ollama 서버 연결 상태 확인
+            if not self.is_models_loaded_ok:
+                self._update_status_indicator("error", "Ollama 서버 오류 (500 에러/모델 로딩 실패)")
+                return
+            self.write_log("나", prompt)
+            
+            # 사용자 질문을 bold로 표시
+            import html
+            # 🌟 FIX: html.escape 처리 후, <code> 태그로 감싸서 폰트가 일관되게 표시되도록 합니다.
+            # 🌟 FIX: 질문 전체가 굵게 표시되도록 <strong> 태그의 범위를 수정합니다.
+            escaped_prompt = html.escape(prompt)
+            # 🌟 FIX: HTML 삽입 전 커서를 문서 끝으로 이동시켜 내용이 섞이는 문제를 방지합니다.
+            self.set_cursor_to_end(self.chat_log)
+            user_html = f"<br><br><strong>나: <code style='background-color: #e9ecef; padding: 2px 4px; border-radius: 3px;'>{escaped_prompt}</code></strong>"
+            self.chat_log.insertHtml(user_html)
+            
+            # 입력창 비활성화 및 취소 버튼 표시
+            self.input_line.setEnabled(False)
+            self.send_button.setEnabled(False)
+            self.cancel_button.setVisible(True)
+
+            # 🌟 FIX: 새 질문 전송 시 이전 코드 블록 내용 초기화
+            self.code_block_contents.clear()
+            
+            self._update_status_indicator("waiting", "응답 대기 중... 0초")
+            self.set_cursor_to_end(self.chat_log) 
+            
+            # 세션별 타이머 시작
+            session = self.sessions[self.current_api]
+            self.request_start_time = time.time()
+            self.elapsed_timer = QTimer(self)
+            self.elapsed_timer.timeout.connect(lambda: self._update_elapsed_time(self.current_api))
+            self.elapsed_timer.start(1000)
+
+            # 세션별 스레드 시작
+            session["thread"] = OllamaThread(self.ollama_api, self.current_model, prompt)
+            session["thread"].response_signal.connect(lambda text: self.handle_response(text, self.current_api))
+            session["thread"].error_signal.connect(lambda msg: self.handle_error(msg, self.current_api))
+            session["thread"].finished_with_time.connect(lambda time: self.handle_finish_time(time, self.current_api))
+            session["thread"].start()
+        else:
+            # 🌟 웹뷰 모드: 로그 기록 없이 단순히 클립보드 복사만
+            self.focus_webview_input(self.current_api)
+
+
+    def focus_webview_input(self, api_name):
+        """클립보드에 텍스트를 복사한 후, 웹뷰의 입력 필드에 포커스를 맞추고 페이지를 맨 아래로 스크롤합니다."""
+        current_web_view = self.web_views.get(api_name)
+        if not current_web_view: 
+            return
+
+        current_web_view.setFocus() 
+
+        # 페이지를 맨 아래로 스크롤하고 입력 필드에 포커스
+        js_scroll_and_focus = """
+            (function() {
+                // 페이지를 맨 아래로 스크롤
+                window.scrollTo(0, document.body.scrollHeight);
+                
+                // 입력 필드 찾기 및 포커스
+                var selectors = [
+                    'textarea[placeholder*="메시지를 입력"]',
+                    'form input[type="text"]',
+                    '#cib-text-input',
+                    '#prompt-textarea',
+                    'textarea',
+                    'input[type="text"]'
+                ];
+                
+                for (var i = 0; i < selectors.length; i++) {
+                    var inputField = document.querySelector(selectors[i]);
+                    if (inputField && inputField.offsetParent !== null) {
+                        inputField.focus();
+                        var textLength = inputField.value.length;
+                        inputField.setSelectionRange(textLength, textLength);
+                        break;
+                    }
+                }
+            })();
+        """
+        current_web_view.page().runJavaScript(js_scroll_and_focus)
+        
+        # 0.5초 후 다시 한번 스크롤 (동적 콘텐츠 로딩 대응)
+        QTimer.singleShot(500, lambda: current_web_view.page().runJavaScript("window.scrollTo(0, document.body.scrollHeight);"))
+
+    def _update_elapsed_time(self, api_name):
+        """세션별 경과 시간을 업데이트합니다."""
+        session = self.sessions[api_name]
+        if self.request_start_time and api_name == self.current_api:
+            elapsed = int(time.time() - self.request_start_time)
+ 
+            self._update_status_indicator("waiting", f"{api_name} 응답 대기 중... {elapsed}초")
+    
+    def handle_finish_time(self, total_time, api_name):
+        # 세션별 타이머 중지
+        session = self.sessions[api_name]
+        if self.elapsed_timer:
+            self.elapsed_timer.stop()
+            self.elapsed_timer = None
+        self.request_start_time = None
+        # 현재 API와 일치할 때만 UI 업데이트
+        if api_name == self.current_api:
+            self.input_line.setEnabled(True)
+            self.send_button.setEnabled(True)
+            self.cancel_button.setVisible(False)
+            
+            formatted_time = f"{total_time:.2f}"
+            self._update_status_indicator("complete", f"응답 완료 (총 {formatted_time}초)")
+        else:
+            # 다른 API의 응답 도착 알림
+            formatted_time = f"{total_time:.2f}"
+            self._update_status_indicator("complete", f"{api_name} 응답 완료 (소요시간 {formatted_time}초)")
+            # 3초 후 현재 모드 상태로 복귀
+            self.notification_timer = QTimer()
+            self.notification_timer.timeout.connect(lambda: self._restore_current_status())
+            self.notification_timer.setSingleShot(True)
+            self.notification_timer.start(3000)
+
+    def handle_response(self, response_text, api_name):
+        # 현재 API와 일치할 때만 처리
+        if api_name == self.current_api:
+            self.write_log("AI", response_text)
+            formatted_response = self._format_response_text(response_text)
+            ai_html = f"<br><strong>AI (Ollama):</strong> {formatted_response}"
+            self.chat_log.insertHtml(ai_html)
+            # 스크롤 위치를 강제로 맨 아래로 이동
+            self.chat_log.ensureCursorVisible()
+            self.set_cursor_to_end(self.chat_log)
+            # 추가 스크롤 보정
+            scrollbar = self.chat_log.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            # 다른 API의 응답도 로그에 기록
+            self.write_log("AI", response_text)
+    
+    # 🌟 FIX: "Copy Code" 링크 클릭을 처리하는 함수
+    def handle_anchor_click(self, url):
+        """<a> 태그 링크 클릭 이벤트를 처리합니다."""
+        url_str = url.toString()
+        if url_str.startswith("copy:"):
+            block_id = url_str.replace("copy:", "")
+            content_to_copy = self.code_block_contents.get(block_id)
+            if content_to_copy:
+                QApplication.clipboard().setText(content_to_copy)
+                self._update_status_indicator("complete", "클립보드에 코드가 복사되었습니다.")
+                # 2초 후 상태 메시지 복원
+                QTimer.singleShot(2000, self._restore_current_status)
+
+
+    def _format_response_text(self, text):
+        """응답 텍스트를 HTML로 포맷팅"""
+        import html
+        import re
+        
+        # 1. 코드 블록(```...```)을 먼저 분리
+        code_blocks = []
+        def replace_code_block(match):
+            # 🌟 FIX: 코드 블록 내부의 특수문자를 이스케이프 처리하고, 줄바꿈은 그대로 둡니다.
+            # 이렇게 하면 <pre> 태그 안에서 코드 형식이 보존됩니다.
+            raw_code = match.group(1)
+            escaped_code = html.escape(raw_code)
+            self.code_block_contents[f"block_{len(code_blocks)}"] = raw_code # 🌟 FIX: 원본 코드 저장
+            code_blocks.append(escaped_code)
+            return f"__CODE_BLOCK_{len(code_blocks)-1}__"
+        text = re.sub(r'```([\s\S]*?)```', replace_code_block, text)
+        
+        # 2. 🌟 FIX: 전체 텍스트에 대해 먼저 HTML 이스케이프를 적용합니다.
+        # 이렇게 하면 모든 <, >가 &lt;, &gt;로 안전하게 변환됩니다.
+        text = html.escape(text)
+
+        # 3. 🌟 FIX: 하드코딩 대신, 안전한 태그 목록과 정규식을 사용하여 대소문자 구분 없이 태그를 복원합니다.
+        safe_tag_names = ['br', 'p', 'strong', 'em', 'ul', 'li']
+        
+        # 복원할 태그 패턴 생성 (예: &lt;/?(br|p|...|li)&gt;)
+        tag_pattern = re.compile(
+            r'&lt;(/?)(' + '|'.join(safe_tag_names) + r')&gt;', 
+            re.IGNORECASE
+        )
+
+        def restore_safe_tag(match):
+            is_closing = match.group(1)  # '/' 또는 ''
+            tag_name = match.group(2).lower()
+            if tag_name == 'br' and is_closing:
+                return ''  # </br> 같은 태그는 무시
+            return f'<{is_closing}{tag_name}>'
+
+        text = tag_pattern.sub(restore_safe_tag, text)
+
+        # 4. 🌟 FIX: 복원되지 않은 나머지 &lt; 와 &gt;는 대괄호로 변환합니다.
+        # (예: AI가 설명 목적으로 사용한 <P> -> [P])
+        text = text.replace('&lt;', '[').replace('&gt;', ']')
+        text = text.replace('&amp;', '&')
+        
+        # 5. 코드 블록을 제외한 영역의 일반 줄바꿈 문자를 <br> 태그로 변환합니다.
+        text = text.replace('\n', '<br>')
+        
+        # 6. 분리해 두었던 코드 블록을 <pre> 태그로 감싸서 최종 복원합니다.
+        for i, escaped_code in enumerate(code_blocks):
+            # 🌟 FIX: <pre> 태그 대신 <div>와 <br>을 사용하여 Copy 버튼이 나타나지 않도록 합니다.
+            # 코드 블록의 시각적 스타일은 유지됩니다.
+            # 🌟 FIX: "Copy Code" 링크 추가
+            copy_link = f"<div style='text-align: right; margin-bottom: -5px; font-size: 9px;'><a href='copy:block_{i}' style='color: #007bff; text-decoration: none;'>Copy Code</a></div>"
+            code_html = f"<div style='background-color: #f8f9fa; padding: 10px; border-radius: 5px; font-family: monospace; white-space: pre-wrap;'>{escaped_code.replace(chr(10), '<br>')}</div>"
+            
+            text = text.replace(f"__CODE_BLOCK_{i}__", f"{copy_link}{code_html}")
+        
+        return text 
+
+
+    def handle_error(self, error_msg, api_name):
+        # 세션별 타이머 중지
+        session = self.sessions[api_name]
+        if self.elapsed_timer:
+            self.elapsed_timer.stop()
+            self.elapsed_timer = None
+        self.request_start_time = None
+         
+        # 현재 API와 일치할 때만 UI 업데이트
+        if api_name == self.current_api:
+            self.input_line.setEnabled(True)
+            self.send_button.setEnabled(True)
+            self.cancel_button.setVisible(False)
+            
+            self.write_log("AI (오류)", error_msg)
+            self.chat_log.append(f"\n오류 발생: {error_msg}")
+            self._update_status_indicator("error", f"오류: {error_msg}")
+            self.set_cursor_to_end(self.chat_log)
+        else:
+            # 다른 API의 오류 알림
+            self._update_status_indicator("error", f"{api_name} 오류 발생!")
+            # 3초 후 현재 모드 상태로 복귀
+            self.notification_timer = QTimer()
+            self.notification_timer.timeout.connect(lambda: self._restore_current_status())
+            self.notification_timer.setSingleShot(True)
+            self.notification_timer.start(3000)
+
+    def _replace_last_message(self, new_content):
+        """마지막 '응답 대기 중...' 메시지를 새 내용으로 대체"""
+        log_content_html = self.chat_log.toHtml()
+        search_str = "<em>응답 대기 중...</em>"
+        last_search_index = log_content_html.rfind(search_str)
+
+        if last_search_index != -1:
+            replace_start_index = last_search_index
+            new_html = log_content_html[:replace_start_index] + new_content
+            self.chat_log.setHtml(new_html)
+        else:
+            self.chat_log.append(new_content)
+
+
+    def set_cursor_to_end(self, text_widget):
+        """커서를 텍스트 끝으로 이동시키고 스크롤합니다."""
+        cursor = text_widget.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End) 
+        text_widget.setTextCursor(cursor)
+    
+    # 🌟 FIX: 현재 웹뷰를 새로고침하는 함수
+    def refresh_current_view(self):
+        """현재 활성화된 웹뷰를 새로고침합니다."""
+        if self.current_api != "Ollama":
+            current_web_view = self.web_views.get(self.current_api)
+            if current_web_view:
+                current_web_view.reload()
+
+    def go_back(self):
+        """웹뷰에서 뒤로가기"""
+        if self.current_api != "Ollama":
+            current_web_view = self.web_views.get(self.current_api)
+            if current_web_view and current_web_view.history().canGoBack():
+                current_web_view.back()
+                # 뒤로가기 후 버튼 상태 업데이트
+                QTimer.singleShot(100, self.update_navigation_buttons)
+    
+    def go_forward(self):
+        """웹뷰에서 앞으로가기"""
+        if self.current_api != "Ollama":
+            current_web_view = self.web_views.get(self.current_api)
+            if current_web_view and current_web_view.history().canGoForward():
+                current_web_view.forward()
+                # 앞으로가기 후 버튼 상태 업데이트
+                QTimer.singleShot(100, self.update_navigation_buttons)
+    
+    def update_navigation_buttons(self):
+        """내비게이션 버튼 상태를 업데이트합니다."""
+        if self.current_api == "Ollama" or not hasattr(self, 'back_button'):
+            return
+            
+        current_web_view = self.web_views.get(self.current_api)
+        if current_web_view:
+            # 뒤로가기 버튼 상태
+            can_go_back = current_web_view.history().canGoBack()
+            self.back_button.setEnabled(can_go_back)
+            
+            # 앞으로가기 버튼 상태
+            can_go_forward = current_web_view.history().canGoForward()
+            self.forward_button.setEnabled(can_go_forward)
+
+            # 새로고침 버튼은 항상 활성화
+            self.refresh_button.setEnabled(True)
+    
+    def keyPressEvent(self, event):
+        """키보드 단축키 처리"""
+        from PyQt6.QtCore import Qt
+        
+        # Alt + 왼쪽 화살표: 뒤로가기
+        if event.modifiers() == Qt.KeyboardModifier.AltModifier and event.key() == Qt.Key.Key_Left:
+            self.go_back()
+            return
+        
+        # Alt + 오른쪽 화살표: 앞으로가기
+        if event.modifiers() == Qt.KeyboardModifier.AltModifier and event.key() == Qt.Key.Key_Right:
+            self.go_forward()
+            return
+
+        # F5 또는 Ctrl+R: 새로고침
+        if event.key() == Qt.Key.Key_F5 or (event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_R):
+            self.refresh_current_view()
+            return
+        
+        super().keyPressEvent(event)
+    
+    def cancel_request(self):
+        """요청 취소"""
+        if self.ollama_thread and self.ollama_thread.isRunning():
+            self.ollama_thread.terminate()
+            self.ollama_thread.wait()
+            
+            # 타이머 중지 및 UI 복원
+            if self.elapsed_timer:
+                self.elapsed_timer.stop()
+                self.elapsed_timer = None
+            self.request_start_time = None
+            
+            self.input_line.setEnabled(True)
+            self.send_button.setEnabled(True)
+            self.cancel_button.setVisible(False)
+            
+            self.chat_log.append("\n[사용자 취소] 요청이 취소되었습니다.")
+            self._update_status_indicator("ready", f"Ollama 모드: 모델 '{self.current_model}' 사용 중")
+            self.set_cursor_to_end(self.chat_log)
+    
+
+
+
+# ====================================================================
+# 터미널 제어권을 반환하고 GUI 앱을 백그라운드에서 실행하는 로직 (Daemonize)
+# ====================================================================
+def daemonize():
+    """
+    프로세스를 포크하여 터미널과 연결을 끊고 독립적인 백그라운드 프로세스로 실행합니다.
+    Linux/Unix 계열 시스템에서만 작동합니다.
+    """
+    try:
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0)  # 부모 프로세스는 종료
+    except OSError as e:
+        sys.stderr.write(f"첫 번째 포크 실패: {e}\n")
+        sys.exit(1)
+
+    os.setsid()
+
+    try:
+        pid = os.fork()
+        if pid > 0:
+            sys.exit(0) # 세션 리더 종료
+    except OSError as e:
+        sys.stderr.write(f"두 번째 포크 실패: {e}\n")
+        sys.exit(1)
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    os.chdir("/")
+    os.umask(0)
+
+
+if __name__ == '__main__':
+    # Linux/macOS에서만 Daemonize 실행
+    # Windows에서는 일반 GUI 앱처럼 실행
+    if sys.platform != "win32":
+         daemonize()
+
+    app = QApplication(sys.argv)
+
+    # 🌟 FIX: 애플리케이션 인스턴스에 아이콘 설정 (전체적인 아이콘 일관성 향상)
+    icon_path = ""
+    if sys.platform == "win32":
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_path, "mindDock.png")
+    else:
+        # Linux: 표준 아이콘 경로 사용
+        icon_path = os.path.expanduser("~/.local/share/icons/mindDock.png")
+
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
+    # 🌟 FIX: 애플리케이션 전체에 일관된 스타일시트 적용
+    app.setStyleSheet("""
+        /* 전체적인 폰트 및 색상 설정 */
+        QWidget {
+            font-family: "Malgun Gothic", "맑은 고딕", "Apple SD Gothic Neo", sans-serif;
+            color: #333;
+        }
+
+        /* 메인 윈도우 및 프레임 배경 */
+        QMainWindow, QFrame#control_frame {
+            background-color: #f0f2f5;
+        }
+
+        /* 입력창 스타일 */
+        QLineEdit#input_line {
+            padding: 8px; border: 1px solid #007bff; border-radius: 5px;
+        }
+        QLineEdit#input_line:disabled {
+            background-color: #f5f5f5; color: #999; border: 1px solid #ccc;
+        }
+
+        /* 버튼 기본 스타일 */
+        QPushButton {
+            border: 1px solid #ccc;
+            padding: 5px 12px;
+            border-radius: 5px;
+            background-color: #fff;
+        }
+        QPushButton:hover {
+            background-color: #e9ecef;
+            border-color: #bbb;
+        }
+        QPushButton:disabled {
+            background-color: #e9ecef;
+            color: #999;
+        }
+
+        /* 주요 액션 버튼 (전송) */
+        QPushButton#send_button {
+            background-color: #007bff;
+            color: white;
+            border-color: #007bff;
+            font-weight: bold;
+        }
+        QPushButton#send_button:hover {
+            background-color: #0056b3;
+        }
+
+        /* 위험 액션 버튼 (종료, 취소) */
+        QPushButton#exit_button, QPushButton#cancel_button {
+            background-color: #dc3545;
+            color: white;
+            border-color: #dc3545;
+        }
+        QPushButton#exit_button:hover, QPushButton#cancel_button:hover {
+            background-color: #c82333;
+        }
+
+        /* 정보 버튼 (About) */
+        QPushButton#about_button {
+            background-color: #6c757d;
+            color: white;
+        }
+        QPushButton#about_button:hover {
+            background-color: #5a6268;
+        }
+
+        /* 캐시 삭제 버튼 스타일 (경고) */
+        QPushButton#clear_cache_button {
+            background-color: #ffc107; /* 노란색 경고 */
+            color: #212529;
+            padding: 5px 12px;
+        }
+        QPushButton#clear_cache_button:hover {
+            background-color: #e0a800;
+        }
+
+        /* 콤보박스 스타일 */
+        QComboBox {
+            padding: 5px; 
+            border: 1px solid #ccc; 
+            border-radius: 3px;
+            background-color: white;
+        }
+        QComboBox::drop-down {
+            border: none;
+        }
+        QComboBox QAbstractItemView {
+            selection-background-color: #007bff;
+            selection-color: white;
+            show-decoration-selected: 0; /* 체크 표시 제거 */
+        }
+    """)
+
+    if sys.platform != "win32":
+        app.setDesktopFileName("mindDock.desktop")
+    chat_app = OllamaChatApp()
+    chat_app.show()
+    sys.exit(app.exec())
