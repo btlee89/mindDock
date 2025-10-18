@@ -1,0 +1,20 @@
+{
+    "KPlugin": {
+        "Id": "mindDock-positioner",
+        "Name": "mindDock Window Positioner",
+        "Description": "Automatically positions mindDock application window at specified coordinates",
+        "Authors": [
+            {
+                "Name": "BTLee"
+            }
+        ],
+        "Category": "Window Management",
+        "License": "MIT",
+        "Version": "1.0"
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "mindDock-positioner.js",
+    "X-KDE-ServiceTypes": [
+        "KWin/Script"
+    ]
+}

@@ -1,0 +1,71 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+a = Analysis(
+    ['D:\\Users\\btlee\\Documents\\mypackage\\mindDock\\mindDock.py'],
+    pathex=[],
+    binaries=[
+    ('D:/Users/btlee/AppData/Local/Programs/Python/Python311/Lib/site-packages/PyQt6/Qt6/plugins/platforms/qwindows.dll', 'PyQt6/Qt6/plugins/platforms'),
+    ('D:/Users/btlee/AppData/Local/Programs/Python/Python311/Lib/site-packages/PyQt6/Qt6/plugins/webview', 'PyQt6/Qt6/plugins/webview'),
+],
+    datas=[('d:/users/btlee/appdata/local/programs/python/python311/lib/site-packages/PyQt6/Qt6/resources', 'PyQt6/Qt6/resources'), ('d:/users/btlee/appdata/local/programs/python/python311/lib/site-packages/PyQt6/Qt6/translations', 'PyQt6/Qt6/translations'), ('mindDock.png', '.')],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,   # 🔸 중요: COLLECT 단계에서 합칠 것이므로 True
+    name='mindDock',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    icon='D:/Users/btlee/Documents/mypackage/mindDock/mindDock.ico'
+)
+
+if 0:
+    exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='mindDock',
+    onefile=False,
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='D:/Users/btlee/Documents/mypackage/mindDock/mindDock.ico'
+    )
+
+# one-dir 방식일 때만 포함하는 부분
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='mindDock'
+)
+
+
+
+
