@@ -190,7 +190,7 @@ class MyWebEnginePage(QWebEnginePage):
 class OllamaChatApp(QMainWindow):
     # 🌟 FIX: 프로그램 관련 정보를 상수로 정의하여 한 곳에서 관리
     APP_NAME = "mindDock"
-    APP_VERSION = "v1.0.2"
+    APP_VERSION = "v1.1.1"
     AUTHOR = "BTLee"
     CONTACT_EMAIL = "byeongtaek.lee@gmail.com"
     COPYRIGHT_YEAR = "2025"
@@ -234,20 +234,36 @@ class OllamaChatApp(QMainWindow):
         
         # ----------------------------------------------------
         # 🌟 핵심 변경: 영구 프로파일 설정
-        # 🌟 핵심 변경: 웹뷰별 영구 프로파일 설정
+        # 🌟 FIX: 포터블 모드 감지 로직 추가
         # ----------------------------------------------------
-        if sys.platform == "win32":
-            # Windows: %APPDATA%\mindDock\profile 경로 사용
-            appdata = os.getenv('APPDATA')
-            base_path = appdata if appdata else os.path.expanduser("~")
-            self.base_profile_path = os.path.join(base_path, self.APP_NAME, "profiles")
+        # 애플리케이션 실행 파일 또는 스크립트가 위치한 디렉토리 결정
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
         else:
-            # Linux/macOS: 기존 경로 유지
-            self.base_profile_path = os.path.join(
-                os.path.expanduser("~"), 
-                ".config", 
-                f"{self.APP_NAME}_profiles"
-            )
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # 🌟 FIX: 포터블 모드 확인 시, 'profiles' 대신 'mindDock_profiles' 폴더를 검사
+        portable_profile_path = os.path.join(app_dir, f"{self.APP_NAME}_portable_profiles")
+        if os.path.isdir(portable_profile_path):
+            # 포터블 모드: 'mindDock_portable_profiles' 폴더를 그대로 사용
+            self.base_profile_path = portable_profile_path
+            print("INFO: 포터블 모드로 실행합니다. 사용자 데이터는 프로그램 폴더에 저장됩니다.")
+        else:
+            # 일반 모드: 시스템의 표준 사용자 데이터 폴더 사용
+            if sys.platform == "win32":
+                # 🌟 FIX: Windows에서도 'mindDock_portable_profiles'를 사용하도록 경로 수정
+                appdata = os.getenv('APPDATA')
+                base_path = appdata if appdata else os.path.expanduser("~")
+                self.base_profile_path = os.path.join(base_path, f"{self.APP_NAME}_portable_profiles")
+            else:
+                # Linux/macOS: ~/.config/mindDock_profiles 경로 사용
+                self.base_profile_path = os.path.join(
+                    os.path.expanduser("~"), 
+                    ".config", 
+                    f"{self.APP_NAME}_profiles"
+                )
+            print("INFO: 일반 모드로 실행합니다. 사용자 데이터는 시스템 폴더에 저장됩니다.")
+
         os.makedirs(self.base_profile_path, exist_ok=True)
 
         # 🌟 FIX: 설정 파일을 profiles 폴더 내의 {APP_NAME}.conf로 지정합니다.
@@ -1059,9 +1075,14 @@ class OllamaChatApp(QMainWindow):
 
     def put_tab_to_shallow_sleep(self, api_name):
         """탭을 얕은 절전 모드로 전환 (렌더링 중지)."""
-        # 🌟 FIX: setPage(None) 대신 setVisible(False)를 사용하여 뷰를 숨깁니다.
+        # 🌟 FIX: CPU 사용률 개선을 위해, 비활성 탭의 페이지를 about:blank로 설정하여 렌더링을 중지합니다.
         view = self.web_views.get(api_name)
         if view and self.sleep_state[api_name] == "awake":
+            # 페이지를 비우기 전에 현재 URL 저장
+            current_url = view.page().url().toString()
+            if current_url and current_url != "about:blank":
+                self.last_urls[api_name] = current_url
+            view.setUrl(QUrl("about:blank"))
             self.sleep_state[api_name] = "shallow"
             print(f"[{api_name}] 탭이 얕은 절전(Shallow Sleep) 모드로 전환되었습니다.")
 
@@ -1083,15 +1104,16 @@ class OllamaChatApp(QMainWindow):
         if not view: return
         
         # 🌟 FIX: setPage를 다시 연결하는 대신 setVisible(True)로 뷰를 다시 표시합니다.
-        if self.sleep_state[api_name] == "shallow":
-            # 얕은 절전 복원: 뷰를 다시 보이게 합니다.
-            print(f"[{api_name}] 탭이 얕은 절전에서 복원되었습니다. (즉시)")
-        elif self.sleep_state[api_name] == "deep":
-            # 🌟 FIX: 깊은 절전 복원 시, 항상 기본 URL로 접속하도록 수정 (로그인 문제 해결)
-            url_map = { "Gemini": "https://gemini.google.com/app", "Perplexity": "https://www.perplexity.ai/", "Copilot": "https://copilot.microsoft.com/", "ChatGPT": "https://chat.openai.com/" }
-            restore_url = url_map.get(api_name)
+        if self.sleep_state[api_name] in ["shallow", "deep"]:
+            # 🌟 FIX: 얕은 절전/깊은 절전 모두 URL을 복원하는 방식으로 통합
+            # 마지막으로 저장된 URL이 있으면 그곳으로, 없으면 기본 URL로 복원
+            restore_url = self.last_urls.get(api_name)
+            if not restore_url or restore_url == "about:blank":
+                url_map = { "Gemini": "https://gemini.google.com/app", "Perplexity": "https://www.perplexity.ai/", "Copilot": "https://copilot.microsoft.com/", "ChatGPT": "https://chat.openai.com/" }
+                restore_url = url_map.get(api_name)
+            
+            print(f"[{api_name}] 탭이 절전 모드에서 복원됩니다. URL: {restore_url}")
             view.setUrl(QUrl(restore_url))
-            print(f"[{api_name}] 탭이 깊은 절전에서 복원되었습니다. (기본 URL로 접속)")
         
         self.sleep_state[api_name] = "awake"
 

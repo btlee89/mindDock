@@ -1,6 +1,6 @@
 [Setup]
 AppName=MindDock
-AppVersion=1.0.2
+AppVersion=1.1.1
 DefaultDirName={pf}\MindDock
 DefaultGroupName=MindDock
 OutputDir=output
